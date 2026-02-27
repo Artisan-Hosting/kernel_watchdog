@@ -4,14 +4,15 @@ This directory contains the Linux kernel pieces that back the Artisan watchdog
 runtime. The kernel module exposes a character device that user space uses to
 register a monitored process and deliver signed heartbeat messages. When the
 heartbeats stop or fail validation, the module escalates to a user-mode helper
-and, ultimately, a system reboot.
+that writes a persistent trip record to pstore/ramoops and, in production
+builds, requests an emergency reboot.
 
 ## Directory Layout
 
 - `driver/` – Out-of-tree kernel module sources (`awdog.c`, `awdog.h`,
   `Makefile`).
-- `init.sh` – Convenience script for inserting/removing the module on dev
-  systems.
+- `userland/` - Saver helper source (`awdog-saver.c`, `Makefile`) installed as
+  `/sbin/awdog-saver`.
 
 ## Build and Install
 
@@ -23,6 +24,20 @@ sudo rmmod awdog        # unload when finished
 
 The module registers `/dev/awdog` and requires `CAP_SYS_ADMIN` to access.
 
+Build the saver helper:
+
+```
+make -C userland
+make -C userland test             # run userland helper tests
+sudo make -C userland install     # installs /sbin/awdog-saver
+```
+
+Helper invocation shape used by the kernel:
+
+```
+/sbin/awdog-saver --phase <phase> --reason <reason> --raw-line "<kernel log line>"
+```
+
 ### Dummy/Test Build
 
 The driver Makefile also supports a non-destructive test build:
@@ -33,9 +48,8 @@ sudo make -C driver install_dummy
 ```
 
 `all_dummy` compiles the module with `-DAWDOG_TEST_MODE=1` and emits
-`driver/awdog_dummy.ko`. In this mode, trip handling logs the reason and runs
-the ko-test helper (`/bin/echo`) instead of invoking `/sbin/awdog-saver` and
-`emergency_restart()`.
+`driver/awdog_dummy.ko`. In this mode, trip handling still invokes
+`/sbin/awdog-saver` to persist trip records, but suppresses reboot.
 
 ## Module Behaviour
 
@@ -53,10 +67,16 @@ the ko-test helper (`/bin/echo`) instead of invoking `/sbin/awdog-saver` and
     `awdog_trip_workfn()`) and the worker calls `awdog_trip_now(reason)`.
   - Verification-failure path: `awdog_write()` calls `awdog_trip_now("verify-failed")`
     directly after dropping the mutex.
-  - Production build: `awdog_trip_now()` runs `/sbin/awdog-saver` and then
-    `emergency_restart()`.
-  - Dummy/test build (`AWDOG_TEST_MODE`): `awdog_trip_now()` suppresses saver
-    and reboot, and calls the ko-test helper instead.
+  - Production build:
+    - `awdog_trip_now()` invokes `/sbin/awdog-saver` with
+      `phase/reason/raw_line` metadata to persist a trip record into
+      `/dev/pmsg0` (picked up by pstore ramoops after reboot).
+    - The reboot path emits an additional `reboot_requested` trip record and
+      then calls `emergency_restart()`.
+  - Dummy/test build (`AWDOG_TEST_MODE`):
+    - `awdog_trip_now()` emits a `test_mode_trip` record through
+      `/sbin/awdog-saver`.
+    - Reboot is suppressed.
 * Unregister/module exit still flush pending trip work with `cancel_work_sync()`
   to guarantee teardown does not race the deferred timeout trip worker.
 
@@ -75,9 +95,21 @@ the ko-test helper (`/bin/echo`) instead of invoking `/sbin/awdog-saver` and
    the updated nonce, timestamps, and computed HMAC.
 4. On shutdown, send `AWDOG_IOCTL_UNREG` and close the file descriptor.
 
-If the heartbeat stream stops or fails integrity checks, the module logs the
-reason and trips through `awdog_trip_now()`: production builds run the saver
-helper and reboot, while `AWDOG_TEST_MODE` builds only run the ko-test helper.
+If the heartbeat stream stops or fails integrity checks, the module trips
+through `awdog_trip_now()` and invokes `/sbin/awdog-saver`. The helper writes a
+JSON `TripRecordMessage` to `/dev/pmsg0` with this shape:
+
+- `ingested_at`: Unix timestamp when the helper emitted the record.
+- `source`: source tag (default `awdog-live-trip`).
+- `phase`: trip classifier (`tamper_tripped`, `reboot_requested`,
+  `heartbeat_rejected`, `test_mode_trip`, or caller-provided structured value).
+- `reason`: parsed trip reason.
+- `raw_line`: full kernel-log-style line for this event.
+- `attributes`: extra parsed key/value pairs, including structured
+  `AWDOG_TRIP key=value` tokens.
+
+For local testing without real pstore, set `AWDOG_PMSG_PATH=/tmp/<file>` before
+running `awdog-saver` to write records into a regular file.
+
 Any consumer that wants to observe or override these actions should hook into
-the user-mode binaries referenced in `awdog_run_soscall()` or adjust them
-during integration.
+`/sbin/awdog-saver` or adjust `awdog_run_soscall()` during integration.

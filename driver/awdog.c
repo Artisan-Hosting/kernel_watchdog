@@ -83,38 +83,47 @@ static void awdog_set_reason_locked(char *dst, size_t dst_len,
     dst[dst_len - 1] = '\0';
 }
 
-static int __maybe_unused awdog_run_ko_test(const char *why) {
-  char *argv[] = {"/bin/echo", (char *)why, NULL};
-  static char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-  pr_emerg(DRV_NAME ": invoking ko-test: %s\n", why);
-  return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-}
-
-static int awdog_run_soscall(const char *reason) {
+static int awdog_run_soscall(const char *phase, const char *reason,
+                             const char *raw_line) {
+  const char *trip_phase = phase ? phase : "tamper_tripped";
   const char *why = reason ? reason : "unknown";
+  const char *line = raw_line ? raw_line : "";
   static char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-  char *argv[] = {"/sbin/awdog-saver", (char *)why, NULL};
+  char *argv[] = {"/sbin/awdog-saver", "--phase", (char *)trip_phase,
+                  "--reason",         (char *)why, "--raw-line",
+                  (char *)line,       NULL};
 
-  pr_emerg("awdog: tamper tripped: %s\n", why);
+  pr_emerg(DRV_NAME ": trip phase=%s reason=%s\n", trip_phase, why);
   return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
 }
 
 static void awdog_run_reboot(const char *reason) {
-  pr_emerg(DRV_NAME ": reboot requested (%s)\n", reason);
+  const char *why = reason ? reason : "unknown";
+  char raw_line[AWDOG_REASON_LEN + 64];
+  scnprintf(raw_line, sizeof(raw_line), DRV_NAME ": reboot requested (%s)", why);
+  if (awdog_run_soscall("reboot_requested", why, raw_line))
+    pr_err(DRV_NAME ": saver helper failed (reboot_requested)\n");
+  pr_emerg(DRV_NAME ": reboot requested (%s)\n", why);
   emergency_restart();
 }
 
 static void awdog_trip_now(const char *reason) {
   const char *why = reason ? reason : "unknown";
+  const char *phase = "tamper_tripped";
+  char raw_line[AWDOG_REASON_LEN + 64];
+  scnprintf(raw_line, sizeof(raw_line), "awdog: tamper tripped: %s", why);
+
+  if (!strcmp(why, "timeout") || !strcmp(why, "verify-failed"))
+    phase = "heartbeat_rejected";
 
 #ifdef AWDOG_TEST_MODE
-  pr_emerg(DRV_NAME ": TEST MODE active, suppressing saver+reboot (%s)\n", why);
-  if (awdog_run_ko_test(why))
-    pr_err(DRV_NAME ": ko-test helper failed (%s)\n", why);
+  pr_emerg(DRV_NAME ": TEST MODE active, suppressing reboot (%s)\n", why);
+  if (awdog_run_soscall("test_mode_trip", why, raw_line))
+    pr_err(DRV_NAME ": saver helper failed (%s)\n", why);
   return;
 #endif
 
-  if (awdog_run_soscall(why))
+  if (awdog_run_soscall(phase, why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (%s)\n", why);
   awdog_run_reboot(why);
 }
@@ -132,7 +141,6 @@ static void awdog_trip_workfn(struct work_struct *work) {
     strscpy(reason, "unknown", sizeof(reason));
 
   awdog_trip_now(reason);
-  // awdog_run_ko_test(reason);
 }
 
 static void awdog_queue_trip(const char *reason) {
