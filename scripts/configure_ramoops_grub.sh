@@ -334,40 +334,37 @@ build_kernel_args() {
 dump_chosen_block() {
   echo ""
   echo "chosen iomem block dump"
-  echo "  start-end: $(printf '%x' "$SELECTED_RANGE_START")-$(printf '%x' "$SELECTED_RANGE_END")"
+  echo "  expected top-level: $SELECTED_LINE"
   echo "  note: showing the top-level line and its immediate indented children"
   echo ""
 
-  awk -v want_s="$SELECTED_RANGE_START" -v want_e="$SELECTED_RANGE_END" '
-    function hex2dec(h,   x) { x = "0x" h; return strtonum(x) }
-
+  # Use the exact chosen line as the anchor (portable across awk implementations)
+  awk -v anchor="$SELECTED_LINE" '
     BEGIN { printing=0; found=0 }
 
-    # Top-level line: starts with hex range at beginning of line (no indentation)
-    /^[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]*:/ {
-      if (printing==1) exit 0
-
-      # Extract start/end hex strings from the prefix
-      split($1, parts, "-")
-      s = hex2dec(parts[1])
-      e = hex2dec(parts[2])
-
-      if (s == want_s && e == want_e) {
-        printing=1
-        found=1
-        print
-        next
-      }
+    # Start printing when we hit the exact chosen line
+    $0 == anchor {
+      printing=1
+      found=1
+      print
+      next
     }
 
-    # Child lines: indented hex range
+    # While printing: print indented children
     printing==1 && /^[[:space:]]+[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]*:/ {
       print
       next
     }
 
+    # Stop when we reach the next top-level range line
+    printing==1 && /^[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]*:/ {
+      exit 0
+    }
+
     END {
-      if (found==0) print "  (could not find chosen block in iomem; check parsing)"
+      if (found==0) {
+        print "  (could not find chosen block line; anchor mismatch)"
+      }
     }
   ' "$IOMEM_PATH"
 }
