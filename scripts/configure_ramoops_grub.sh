@@ -9,6 +9,10 @@ IOMEM_PATH="${AWDOG_IOMEM_PATH:-/proc/iomem}"
 BASE_ALIGN_BYTES=$((1 * 1024 * 1024))
 GUARD_BYTES=$((64 * 1024 * 1024))
 VERIFY=0
+DUMP_BLOCK=0
+FOUND_FORBIDDEN_CHILD=0
+FORBIDDEN_HIT_LINE=""
+FORBIDDEN_HIT_PARENT=""
 GRUB_DROPIN="/etc/default/grub.d/40-awdog-ramoops.cfg"
 
 SELECTED_LINE=""
@@ -28,6 +32,7 @@ Options:
   --dry-run     Print discovered reservation and generated kernel args (default)
   --apply       Write GRUB drop-in and rebuild GRUB config (requires root)
   --verify      Print candidate validation details from /proc/iomem
+  --dump-chosen-block  Print the chosen /proc/iomem block (and indented children) for debugging
   -h, --help    Show this help text
 USAGE
 }
@@ -81,6 +86,9 @@ parse_args() {
         ;;
       --verify)
         VERIFY=1
+        ;;
+      --dump-chosen-block)
+        DUMP_BLOCK=1
         ;;
       -h|--help)
         usage
@@ -177,13 +185,19 @@ find_region() {
       continue
     fi
 
-    if [[ "$line" =~ ^[[:space:]]+[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]+:[[:space:]](.+)$ ]] && \
-       (( current_active == 1 )); then
-      local child_label=${BASH_REMATCH[1]}
-      if is_forbidden_marker "$child_label"; then
-        current_forbidden=1
+  if [[ "$line" =~ ^[[:space:]]+([0-9A-Fa-f]+)-([0-9A-Fa-f]+)[[:space:]]+:[[:space:]](.+)$ ]] && \
+     (( current_active == 1 )); then
+    local child_label=${BASH_REMATCH[3]}
+    if is_forbidden_marker "$child_label"; then
+      current_forbidden=1
+      FOUND_FORBIDDEN_CHILD=1
+      if [[ -z "$FORBIDDEN_HIT_LINE" ]]; then
+        FORBIDDEN_HIT_LINE="$line"
+        FORBIDDEN_HIT_PARENT="$current_line"
       fi
     fi
+  fi
+
   done < "$IOMEM_PATH"
 
   if (( current_active == 1 )); then
@@ -253,23 +267,109 @@ build_kernel_args() {
   local size_bytes=$2
   local base_hex
 
-  # Keep partitioning simple and proportional for arbitrary --size-m.
-  local record_size=$((size_bytes / 4))
-  local console_size=$((size_bytes / 4))
-  local pmsg_size=$((size_bytes / 16))
+  # 4K alignment for pstore internals
+  local align=4096
 
-  record_size=$(align_down "$record_size" 4096)
-  console_size=$(align_down "$console_size" 4096)
-  pmsg_size=$(align_down "$pmsg_size" 4096)
+  # Minimum practical sizes
+  local min_record=$((128 * 1024))  # 128 KiB
+  local min_console=$((512 * 1024)) # 512 KiB
+  local min_pmsg=$((128 * 1024))    # 128 KiB (set to 0 if you don't need pmsg)
 
-  (( record_size >= 4096 )) || record_size=4096
-  (( console_size >= 4096 )) || console_size=4096
-  (( pmsg_size >= 4096 )) || pmsg_size=4096
+  # Start with minima (aligned)
+  local record_size console_size pmsg_size
+  record_size=$(align_down "$min_record" "$align")
+  console_size=$(align_down "$min_console" "$align")
+  pmsg_size=$(align_down "$min_pmsg" "$align")
+
+  # If the reservation is tiny, degrade gracefully
+  local overhead=$((record_size + console_size + pmsg_size))
+  if (( overhead > size_bytes )); then
+    # shrink pmsg first, then console, then record (but keep >= 4K)
+    pmsg_size=0
+    overhead=$((record_size + console_size))
+    if (( overhead > size_bytes )); then
+      console_size=$(align_down $((size_bytes / 2)) "$align")
+      record_size=$(align_down $((size_bytes - console_size)) "$align")
+      (( record_size < align )) && record_size=$align
+      (( console_size < align )) && console_size=$align
+      pmsg_size=0
+    fi
+  fi
+
+  # Remaining bytes go mostly to console (for marker retention),
+  # with some to record_size to allow multiple records.
+  local remaining=$((size_bytes - (record_size + console_size + pmsg_size)))
+  if (( remaining > 0 )); then
+    # Give 75% of remaining to console, 25% to record.
+    local add_console=$(( (remaining * 3) / 4 ))
+    local add_record=$(( remaining - add_console ))
+    add_console=$(align_down "$add_console" "$align")
+    add_record=$(align_down "$add_record" "$align")
+
+    console_size=$((console_size + add_console))
+    record_size=$((record_size + add_record))
+
+    # If alignment rounding lost bytes, shove leftovers into console.
+    local used=$((record_size + console_size + pmsg_size))
+    local slack=$((size_bytes - used))
+    if (( slack >= align )); then
+      slack=$(align_down "$slack" "$align")
+      console_size=$((console_size + slack))
+    fi
+  fi
+
+  # Sanity: ensure non-zero (except pmsg which may be 0)
+  (( record_size >= align )) || record_size=$align
+  (( console_size >= align )) || console_size=$align
+  pmsg_size=$(align_down "$pmsg_size" "$align")
 
   base_hex=$(to_hex "$base")
+
+  # Note: using "$SIZE_M"M is fine since size_bytes derived from it.
   printf 'memmap=%sM\\$%s ramoops.mem_address=%s ramoops.mem_size=%s ramoops.record_size=%s ramoops.console_size=%s ramoops.pmsg_size=%s ramoops.ecc=0\n' \
     "$SIZE_M" "$base_hex" "$base_hex" "$(to_hex "$size_bytes")" \
     "$(to_hex "$record_size")" "$(to_hex "$console_size")" "$(to_hex "$pmsg_size")"
+}
+
+dump_chosen_block() {
+  echo ""
+  echo "chosen iomem block dump"
+  echo "  start-end: $(printf '%x' "$SELECTED_RANGE_START")-$(printf '%x' "$SELECTED_RANGE_END")"
+  echo "  note: showing the top-level line and its immediate indented children"
+  echo ""
+
+  awk -v want_s="$SELECTED_RANGE_START" -v want_e="$SELECTED_RANGE_END" '
+    function hex2dec(h,   x) { x = "0x" h; return strtonum(x) }
+
+    BEGIN { printing=0; found=0 }
+
+    # Top-level line: starts with hex range at beginning of line (no indentation)
+    /^[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]*:/ {
+      if (printing==1) exit 0
+
+      # Extract start/end hex strings from the prefix
+      split($1, parts, "-")
+      s = hex2dec(parts[1])
+      e = hex2dec(parts[2])
+
+      if (s == want_s && e == want_e) {
+        printing=1
+        found=1
+        print
+        next
+      }
+    }
+
+    # Child lines: indented hex range
+    printing==1 && /^[[:space:]]+[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]*:/ {
+      print
+      next
+    }
+
+    END {
+      if (found==0) print "  (could not find chosen block in iomem; check parsing)"
+    }
+  ' "$IOMEM_PATH"
 }
 
 run_apply() {
@@ -327,6 +427,14 @@ main() {
   echo ""
   echo "kernel args"
   echo "  $kernel_args"
+
+  if (( DUMP_BLOCK == 1 )); then
+    dump_chosen_block
+    echo ""
+    echo "forbidden marker first hit:"
+    echo "  parent: ${FORBIDDEN_HIT_PARENT:-<none>}"
+    echo "  child : ${FORBIDDEN_HIT_LINE:-<none>}"
+  fi
 
   if [[ "$MODE" == "dry-run" ]]; then
     echo ""
