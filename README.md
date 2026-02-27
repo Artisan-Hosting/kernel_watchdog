@@ -51,6 +51,27 @@ sudo make -C driver install_dummy
 `driver/awdog_dummy.ko`. In this mode, trip handling still invokes
 `/sbin/awdog-saver` to persist trip records, but suppresses reboot.
 
+## Automate ramoops Reservation
+
+The saver helper writes trip records to `/dev/pmsg0`, so production setups
+should reserve persistent RAM for pstore/ramoops at boot.
+
+Use the helper script to auto-discover a suitable top-level `System RAM` range
+from `/proc/iomem`, generate kernel args, and optionally apply GRUB changes:
+
+```
+./scripts/configure_ramoops_grub.sh --dry-run
+./scripts/configure_ramoops_grub.sh --size-m 4 --dry-run
+sudo ./scripts/configure_ramoops_grub.sh --size-m 2 --apply
+```
+
+Flags:
+
+- `--size-m N`: reserve `N` MiB (default `2`).
+- `--dry-run`: discovery + generated args only (default mode).
+- `--apply`: writes `/etc/default/grub.d/40-awdog-ramoops.cfg`, rebuilds GRUB
+  config, then requires a reboot.
+
 ## Module Behaviour
 
 * State lives in a single global context (`struct awdog_ctx`). Registration
