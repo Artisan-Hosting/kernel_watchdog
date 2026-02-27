@@ -23,6 +23,20 @@ sudo rmmod awdog        # unload when finished
 
 The module registers `/dev/awdog` and requires `CAP_SYS_ADMIN` to access.
 
+### Dummy/Test Build
+
+The driver Makefile also supports a non-destructive test build:
+
+```
+make -C driver all_dummy      # builds awdog_dummy.ko
+sudo make -C driver install_dummy
+```
+
+`all_dummy` compiles the module with `-DAWDOG_TEST_MODE=1` and emits
+`driver/awdog_dummy.ko`. In this mode, trip handling logs the reason and runs
+the ko-test helper (`/bin/echo`) instead of invoking `/sbin/awdog-saver` and
+`emergency_restart()`.
+
 ## Module Behaviour
 
 * State lives in a single global context (`struct awdog_ctx`). Registration
@@ -34,17 +48,17 @@ The module registers `/dev/awdog` and requires `CAP_SYS_ADMIN` to access.
   - Is authenticated with HMAC-SHA256 (`crypto_shash`).
   - Includes a monotonic and real-time timestamp so we can log latency
     information.
-* On timeout or verification failure the module uses deferred work items to
-  transition out of atomic context:
-  - `awdog_queue_soscall()` captures the reason string and schedules a worker
-    that invokes `/usr/bin/logger` via `call_usermodehelper()`.
-  - `awdog_queue_reboot()` schedules a companion worker that eventually calls
+* Trigger logic is simplified around a single trip path (`awdog_trip_now()`):
+  - Timeout path: timer callback queues one work item (`awdog_queue_trip()` ->
+    `awdog_trip_workfn()`) and the worker calls `awdog_trip_now(reason)`.
+  - Verification-failure path: `awdog_write()` calls `awdog_trip_now("verify-failed")`
+    directly after dropping the mutex.
+  - Production build: `awdog_trip_now()` runs `/sbin/awdog-saver` and then
     `emergency_restart()`.
-  The queuing path avoids taking the module mutex in the timer callback, so we
-  never sleep while the timer runs.
-* Registration/unregistration and module exit flush the outstanding work items
-  with `cancel_work_sync()` to guarantee user-mode helper invocations finish
-  before teardown.
+  - Dummy/test build (`AWDOG_TEST_MODE`): `awdog_trip_now()` suppresses saver
+    and reboot, and calls the ko-test helper instead.
+* Unregister/module exit still flush pending trip work with `cancel_work_sync()`
+  to guarantee teardown does not race the deferred timeout trip worker.
 
 ## User-Space Contract
 
@@ -62,8 +76,8 @@ The module registers `/dev/awdog` and requires `CAP_SYS_ADMIN` to access.
 4. On shutdown, send `AWDOG_IOCTL_UNREG` and close the file descriptor.
 
 If the heartbeat stream stops or fails integrity checks, the module logs the
-reason, attempts the configured user-mode helper, and triggers an emergency
-restart. Any consumer that wants to observe or override these actions should
-hook into the user-mode binaries referenced in `awdog_run_soscall()` or adjust
-them during integration.
-
+reason and trips through `awdog_trip_now()`: production builds run the saver
+helper and reboot, while `AWDOG_TEST_MODE` builds only run the ko-test helper.
+Any consumer that wants to observe or override these actions should hook into
+the user-mode binaries referenced in `awdog_run_soscall()` or adjust them
+during integration.
