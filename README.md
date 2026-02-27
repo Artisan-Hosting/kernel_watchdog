@@ -61,14 +61,25 @@ from `/proc/iomem`, generate kernel args, and optionally apply GRUB changes:
 
 ```
 ./scripts/configure_ramoops_grub.sh --dry-run
+./scripts/configure_ramoops_grub.sh --verify --dry-run
 ./scripts/configure_ramoops_grub.sh --size-m 4 --dry-run
 sudo ./scripts/configure_ramoops_grub.sh --size-m 2 --apply
 ```
+
+Selection rules:
+
+- Ignores `System RAM` ranges with child markers such as `Crash kernel`,
+  `Kernel ...`, `reserved`, or `ACPI ...`.
+- Enforces a 64 MiB guard band at both ends of the chosen range.
+- Aligns base to 1 MiB and sub-buffer sizes to 4 KiB.
+- Prefers the largest valid `System RAM` range, then places the reservation away
+  from the range end (centered within the guarded window when possible).
 
 Flags:
 
 - `--size-m N`: reserve `N` MiB (default `2`).
 - `--dry-run`: discovery + generated args only (default mode).
+- `--verify`: print chosen `/proc/iomem` line, guard window, and final base/end.
 - `--apply`: writes `/etc/default/grub.d/40-awdog-ramoops.cfg`, rebuilds GRUB
   config, then requires a reboot.
 

@@ -6,17 +6,28 @@ DEFAULT_SIZE_M=2
 SIZE_M=$DEFAULT_SIZE_M
 MODE="dry-run"
 IOMEM_PATH="${AWDOG_IOMEM_PATH:-/proc/iomem}"
-ALIGN_BYTES=$((2 * 1024 * 1024))
+BASE_ALIGN_BYTES=$((1 * 1024 * 1024))
+GUARD_BYTES=$((64 * 1024 * 1024))
+VERIFY=0
 GRUB_DROPIN="/etc/default/grub.d/40-awdog-ramoops.cfg"
+
+SELECTED_LINE=""
+SELECTED_RANGE_START=0
+SELECTED_RANGE_END=0
+SELECTED_USABLE_START=0
+SELECTED_USABLE_END_EXCL=0
+SELECTED_BASE=0
+SELECTED_END=0
 
 usage() {
   cat <<USAGE
-Usage: $SCRIPT_NAME [--size-m N] [--dry-run | --apply]
+Usage: $SCRIPT_NAME [--size-m N] [--dry-run | --apply] [--verify]
 
 Options:
   --size-m N    Reserve N MiB for ramoops (default: $DEFAULT_SIZE_M)
   --dry-run     Print discovered reservation and generated kernel args (default)
   --apply       Write GRUB drop-in and rebuild GRUB config (requires root)
+  --verify      Print candidate validation details from /proc/iomem
   -h, --help    Show this help text
 USAGE
 }
@@ -32,8 +43,24 @@ align_down() {
   echo $((value & ~(align - 1)))
 }
 
+align_up() {
+  local value=$1
+  local align=$2
+  echo $(((value + align - 1) & ~(align - 1)))
+}
+
 to_hex() {
   printf '0x%x' "$1"
+}
+
+is_forbidden_marker() {
+  local marker="${1,,}"
+
+  [[ "$marker" == *"crash kernel"* ]] && return 0
+  [[ "$marker" == kernel\ * ]] && return 0
+  [[ "$marker" == *reserved* ]] && return 0
+  [[ "$marker" == acpi* ]] && return 0
+  return 1
 }
 
 parse_args() {
@@ -52,6 +79,9 @@ parse_args() {
       --apply)
         MODE="apply"
         ;;
+      --verify)
+        VERIFY=1
+        ;;
       -h|--help)
         usage
         exit 0
@@ -64,42 +94,126 @@ parse_args() {
   done
 }
 
+consider_candidate() {
+  local start=$1
+  local end=$2
+  local forbidden=$3
+  local line="$4"
+  local size_bytes=$5
+  local -n best_size_ref=$6
+  local -n best_start_ref=$7
+  local -n best_end_ref=$8
+  local -n best_line_ref=$9
+  local -n best_usable_start_ref=${10}
+  local -n best_usable_end_excl_ref=${11}
+  local -n found_ref=${12}
+
+  local range_size
+  local usable_start
+  local usable_end_excl
+  local usable_size
+
+  (( forbidden == 0 )) || return 0
+
+  range_size=$((end - start + 1))
+  usable_start=$((start + GUARD_BYTES))
+  usable_end_excl=$((end + 1 - GUARD_BYTES))
+  usable_size=$((usable_end_excl - usable_start))
+
+  (( usable_size >= size_bytes )) || return 0
+
+  if (( range_size > best_size_ref )) || \
+     (( range_size == best_size_ref && end > best_end_ref )); then
+    best_size_ref=$range_size
+    best_start_ref=$start
+    best_end_ref=$end
+    best_line_ref="$line"
+    best_usable_start_ref=$usable_start
+    best_usable_end_excl_ref=$usable_end_excl
+    found_ref=1
+  fi
+}
+
 find_region() {
   local size_bytes=$1
+  local best_size=0
   local best_start=0
   local best_end=0
-  local line
+  local best_line=""
+  local best_usable_start=0
+  local best_usable_end_excl=0
   local found=0
+
+  local current_active=0
+  local current_forbidden=0
+  local current_start=0
+  local current_end=0
+  local current_line=""
+
+  local line
 
   [[ -r "$IOMEM_PATH" ]] || fail "cannot read $IOMEM_PATH"
 
   while IFS= read -r line; do
-    if [[ "$line" =~ ^([0-9A-Fa-f]+)-([0-9A-Fa-f]+)[[:space:]]+:[[:space:]]System[[:space:]]RAM$ ]]; then
+    if [[ "$line" =~ ^([0-9A-Fa-f]+)-([0-9A-Fa-f]+)[[:space:]]+:[[:space:]](.+)$ ]]; then
       local start_hex=${BASH_REMATCH[1]}
       local end_hex=${BASH_REMATCH[2]}
-      local start=$((16#$start_hex))
-      local end=$((16#$end_hex))
-      local region_size=$((end - start + 1))
+      local label=${BASH_REMATCH[3]}
 
-      if (( region_size >= size_bytes )); then
-        if (( end > best_end )); then
-          best_start=$start
-          best_end=$end
-          found=1
-        fi
+      if (( current_active == 1 )); then
+        consider_candidate "$current_start" "$current_end" "$current_forbidden" \
+          "$current_line" "$size_bytes" best_size best_start best_end best_line \
+          best_usable_start best_usable_end_excl found
+      fi
+
+      current_active=0
+      if [[ "${label,,}" == "system ram" ]]; then
+        current_active=1
+        current_forbidden=0
+        current_start=$((16#$start_hex))
+        current_end=$((16#$end_hex))
+        current_line="$line"
+      fi
+      continue
+    fi
+
+    if [[ "$line" =~ ^[[:space:]]+[0-9A-Fa-f]+-[0-9A-Fa-f]+[[:space:]]+:[[:space:]](.+)$ ]] && \
+       (( current_active == 1 )); then
+      local child_label=${BASH_REMATCH[1]}
+      if is_forbidden_marker "$child_label"; then
+        current_forbidden=1
       fi
     fi
   done < "$IOMEM_PATH"
 
-  (( found == 1 )) || fail "no top-level System RAM region is large enough for ${SIZE_M} MiB"
-
-  local candidate
-  candidate=$(align_down $((best_end + 1 - size_bytes)) "$ALIGN_BYTES")
-  if (( candidate < best_start )); then
-    fail "found RAM region but no ${ALIGN_BYTES}-byte aligned window of ${SIZE_M} MiB inside it"
+  if (( current_active == 1 )); then
+    consider_candidate "$current_start" "$current_end" "$current_forbidden" \
+      "$current_line" "$size_bytes" best_size best_start best_end best_line \
+      best_usable_start best_usable_end_excl found
   fi
 
-  echo "$candidate $best_start $best_end"
+  (( found == 1 )) || fail "no top-level System RAM region is large enough for ${SIZE_M} MiB"
+
+  local min_base max_base mid base
+  min_base=$(align_up "$best_usable_start" "$BASE_ALIGN_BYTES")
+  max_base=$(align_down $((best_usable_end_excl - size_bytes)) "$BASE_ALIGN_BYTES")
+
+  if (( min_base > max_base )); then
+    fail "found System RAM region but no ${BASE_ALIGN_BYTES}-byte aligned window of ${SIZE_M} MiB inside guarded range"
+  fi
+
+  mid=$((best_usable_start + ((best_usable_end_excl - best_usable_start - size_bytes) / 2)))
+  base=$(align_down "$mid" "$BASE_ALIGN_BYTES")
+  (( base < min_base )) && base=$min_base
+  (( base > max_base )) && base=$max_base
+
+  SELECTED_LINE="$best_line"
+  SELECTED_RANGE_START=$best_start
+  SELECTED_RANGE_END=$best_end
+  SELECTED_USABLE_START=$best_usable_start
+  SELECTED_USABLE_END_EXCL=$best_usable_end_excl
+  SELECTED_BASE=$base
+  SELECTED_END=$((base + size_bytes - 1))
 }
 
 detect_grub_mkconfig_cmd() {
@@ -189,21 +303,27 @@ main() {
   parse_args "$@"
 
   local size_bytes=$((SIZE_M * 1024 * 1024))
-  local discovery
-  local base
-  local region_start
-  local region_end
   local kernel_args
 
-  discovery=$(find_region "$size_bytes")
-  read -r base region_start region_end <<< "$discovery"
-  kernel_args=$(build_kernel_args "$base" "$size_bytes")
+  find_region "$size_bytes"
+  kernel_args=$(build_kernel_args "$SELECTED_BASE" "$size_bytes")
 
   echo "ramoops discovery result"
   echo "  requested_size_mib: $SIZE_M"
   echo "  reserved_size_bytes: $size_bytes"
-  echo "  selected_base: $(to_hex "$base")"
-  echo "  selected_region: $(to_hex "$region_start")-$(to_hex "$region_end")"
+  echo "  selected_base: $(to_hex "$SELECTED_BASE")"
+  echo "  selected_end: $(to_hex "$SELECTED_END")"
+  echo "  selected_region: $(to_hex "$SELECTED_RANGE_START")-$(to_hex "$SELECTED_RANGE_END")"
+
+  if (( VERIFY == 1 )); then
+    echo ""
+    echo "verification"
+    echo "  chosen_iomem_line: $SELECTED_LINE"
+    echo "  guard_band_each_side_bytes: $GUARD_BYTES"
+    echo "  guarded_window: $(to_hex "$SELECTED_USABLE_START")-$(to_hex "$((SELECTED_USABLE_END_EXCL - 1))")"
+    echo "  final_base_end: $(to_hex "$SELECTED_BASE")-$(to_hex "$SELECTED_END")"
+  fi
+
   echo ""
   echo "kernel args"
   echo "  $kernel_args"
