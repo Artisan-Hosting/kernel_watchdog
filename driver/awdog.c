@@ -103,7 +103,8 @@ static void awdog_run_reboot(const char *reason) {
   scnprintf(raw_line, sizeof(raw_line), DRV_NAME ": reboot requested (%s)", why);
   if (awdog_run_soscall("reboot_requested", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (reboot_requested)\n");
-  emergency_restart();
+  // emergency_restart();
+  panic();
 }
 
 static void awdog_trip_now(const char *reason) {

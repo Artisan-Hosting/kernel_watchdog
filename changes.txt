@@ -1,0 +1,83 @@
+Goal
+
+Use pstore + ramoops (pstore backend in reserved RAM) so the kernel can leave a “crash/reboot reason” that user space can read after reboot.
+
+What went wrong
+
+Reserving RAM with memmap= broke the VM boot
+
+memmap edits the guest’s E820 memory map.
+
+In our case it caused early memory allocation failures and a panic:
+
+.text .data .bss are not marked as E820_TYPE_RAM!
+
+alloc_low_pages: can not alloc memory
+
+That’s a sign the firmware memory map got mangled such that the kernel couldn’t allocate early page tables / lowmem.
+
+Trying to use ramoops without memmap= was unstable / invalid
+
+Removing memmap avoided the panic, but ramoops then rejected our address (invalid for parameter mem_address) and/or could overlap with kernel-used RAM depending on layout and KASLR.
+
+VM memory layout differed across Fedora vs Debian and across boots, making “pick a safe RAM window” harder than it looked.
+
+Bottom line: ram-backed persistence was becoming fragile and environment-dependent in Proxmox VMs.
+
+The new approach: pstore-blk (disk-backed pstore)
+What we switched to
+
+We changed the pstore backend from ramoops (RAM) to pstore-blk (block device).
+
+Instead of reserving RAM, we added a tiny dedicated virtual disk in Proxmox:
+
+/dev/sda (512MB)
+
+Then we configured the kernel’s pstore system to store crash/reboot logs on that disk using the pstore_blk module.
+
+Why this is better in Proxmox
+
+No E820 / memmap changes → no early boot panics
+
+No dependence on “RAM surviving reboot” → survives guest reboot and power cycle
+
+No dependence on kernel placement/KASLR memory overlaps → predictable
+
+Still exposes logs via the standard interface:
+
+/sys/fs/pstore/*
+
+Operational changes we made
+1) Kernel/module configuration
+
+Removed ramoops-related GRUB drop-in and module loads.
+
+Configured pstore_blk with:
+
+blkdev=/dev/sda
+
+buffer sizes (kmsg_size, console_size, pmsg_size, etc.)
+
+best_effort=Y to avoid strict backend requirements in a VM
+
+Enabled broader capture:
+
+max_reason=7 (more than just oops/panic)
+
+Enabled dumping on reboot paths:
+
+printk.always_kmsg_dump=Y
+
+2) Manual control of pstore artifacts
+
+Disabled and masked systemd-pstore so it doesn’t auto-archive/clear
+
+Your watchdog will:
+
+read /sys/fs/pstore/*
+
+archive to your own location/format
+
+forward a structured “incident report” to the manager
+
+clear /sys/fs/pstore/* when done

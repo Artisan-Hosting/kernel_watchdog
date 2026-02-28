@@ -1,0 +1,7 @@
+
+systemctl disable --now systemd-pstore.service systemd-pstore.socket
+systemctl mask systemd-pstore.service systemd-pstore.socket
+modprobe ramoops
+
+systemd-networkd-wait-online
+
