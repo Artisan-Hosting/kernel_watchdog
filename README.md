@@ -102,7 +102,8 @@ Flags:
   - Production build:
     - `awdog_trip_now()` invokes `/sbin/awdog-saver` with
       `phase/reason/raw_line` metadata to persist a trip record into
-      `/dev/pmsg0` (picked up by pstore ramoops after reboot).
+      `/dev/pmsg0` (persisted by the configured pstore backend, e.g.
+      `pstore_blk`).
     - The reboot path emits an additional `reboot_requested` trip record and
       then calls `emergency_restart()`.
   - Dummy/test build (`AWDOG_TEST_MODE`):
@@ -133,6 +134,8 @@ JSON `TripRecordMessage` to `/dev/pmsg0` with this shape:
 
 - `ingested_at`: Unix timestamp when the helper emitted the record.
 - `source`: source tag (default `awdog-live-trip`).
+- `pstore_backend`: backend tag (default `pstore_blk`).
+- `pstore_sink`: write target path (default `/dev/pmsg0`).
 - `phase`: trip classifier (`tamper_tripped`, `reboot_requested`,
   `heartbeat_rejected`, `test_mode_trip`, or caller-provided structured value).
 - `reason`: parsed trip reason.
@@ -140,8 +143,10 @@ JSON `TripRecordMessage` to `/dev/pmsg0` with this shape:
 - `attributes`: extra parsed key/value pairs, including structured
   `AWDOG_TRIP key=value` tokens.
 
-For local testing without real pstore, set `AWDOG_PMSG_PATH=/tmp/<file>` before
-running `awdog-saver` to write records into a regular file.
+Path overrides for integration testing:
+
+- The saver always emits `pstore_backend` as `pstore_blk`.
+- `AWDOG_PSTORE_PATH=/tmp/<file>` or `--pstore-path <path>`
 
 Any consumer that wants to observe or override these actions should hook into
 `/sbin/awdog-saver` or adjust `awdog_run_soscall()` during integration.

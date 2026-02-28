@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #define AWDOG_DEFAULT_SOURCE "awdog-live-trip"
+#define AWDOG_DEFAULT_PSTORE_BACKEND "pstore_blk"
+#define AWDOG_DEFAULT_PSTORE_PATH "/dev/sda"
 #define AWDOG_MAX_ATTRS 32
 #define AWDOG_MAX_KEY_LEN 64
 #define AWDOG_MAX_VAL_LEN 256
@@ -29,7 +31,7 @@ struct awdog_attr_set {
 static void awdog_usage(const char *prog) {
   fprintf(stderr,
           "Usage: %s [--phase PHASE] [--reason REASON] [--raw-line LINE] "
-          "[--source SOURCE] [MESSAGE]\n",
+          "[--source SOURCE] [--pstore-path PATH] [MESSAGE]\n",
           prog);
 }
 
@@ -116,7 +118,9 @@ static const char *awdog_find_attr(const struct awdog_attr_set *set,
 static bool awdog_reserved_key(const char *key) {
   return awdog_streq(key, "phase") || awdog_streq(key, "reason") ||
          awdog_streq(key, "raw_line") || awdog_streq(key, "source") ||
-         awdog_streq(key, "ingested_at");
+         awdog_streq(key, "ingested_at") ||
+         awdog_streq(key, "pstore_backend") || awdog_streq(key, "backend") ||
+         awdog_streq(key, "pstore_sink") || awdog_streq(key, "pstore_path");
 }
 
 static void awdog_parse_attrs(const char *input, struct awdog_attr_set *attrs) {
@@ -247,13 +251,15 @@ int main(int argc, char **argv) {
   const char *reason_arg = NULL;
   const char *raw_line_arg = NULL;
   const char *source_arg = NULL;
+  const char *pstore_path_arg = NULL;
   const char *phase;
   const char *reason;
   const char *raw_line;
   const char *source;
+  const char *backend;
+  const char *pstore_path;
   const char *env_source;
-  const char *env_pmsg_path;
-  const char *pmsg_path;
+  const char *env_pstore_path;
   struct awdog_attr_set attrs = {0};
   char *message = NULL;
   char raw_line_buf[512];
@@ -297,6 +303,14 @@ int main(int argc, char **argv) {
         goto out;
       }
       source_arg = argv[++i];
+      continue;
+    }
+    if (!strcmp(argv[i], "--pstore-path")) {
+      if (i + 1 >= argc) {
+        awdog_usage(argv[0]);
+        goto out;
+      }
+      pstore_path_arg = argv[++i];
       continue;
     }
     if (!strcmp(argv[i], "--")) {
@@ -349,10 +363,14 @@ int main(int argc, char **argv) {
   if (!source || !*source)
     source = AWDOG_DEFAULT_SOURCE;
 
-  env_pmsg_path = getenv("AWDOG_PMSG_PATH");
-  pmsg_path = env_pmsg_path;
-  if (!pmsg_path || !*pmsg_path)
-    pmsg_path = "/dev/pmsg0";
+  backend = AWDOG_DEFAULT_PSTORE_BACKEND;
+
+  env_pstore_path = getenv("AWDOG_PSTORE_PATH");
+  pstore_path = pstore_path_arg ? pstore_path_arg : awdog_find_attr(&attrs, "pstore_path");
+  if (!pstore_path || !*pstore_path)
+    pstore_path = env_pstore_path;
+  if (!pstore_path || !*pstore_path)
+    pstore_path = AWDOG_DEFAULT_PSTORE_PATH;
 
   mem = open_memstream(&payload, &payload_len);
   if (!mem) {
@@ -365,6 +383,10 @@ int main(int argc, char **argv) {
   fprintf(mem, "%lld", (long long)now);
   fputs(",\"source\":", mem);
   awdog_json_string(mem, source);
+  fputs(",\"pstore_backend\":", mem);
+  awdog_json_string(mem, backend);
+  fputs(",\"pstore_sink\":", mem);
+  awdog_json_string(mem, pstore_path);
   fputs(",\"phase\":", mem);
   awdog_json_string(mem, phase);
   fputs(",\"reason\":", mem);
@@ -392,19 +414,21 @@ int main(int argc, char **argv) {
   }
   mem = NULL;
 
-  if (env_pmsg_path && *env_pmsg_path)
-    fd = open(pmsg_path, O_WRONLY | O_CLOEXEC | O_APPEND | O_CREAT, 0644);
+  if ((pstore_path_arg && *pstore_path_arg) ||
+      (awdog_find_attr(&attrs, "pstore_path")) ||
+      (env_pstore_path && *env_pstore_path))
+    fd = open(pstore_path, O_WRONLY | O_CLOEXEC | O_APPEND | O_CREAT, 0644);
   else
-    fd = open(pmsg_path, O_WRONLY | O_CLOEXEC);
+    fd = open(pstore_path, O_WRONLY | O_CLOEXEC);
   if (fd < 0) {
-    fprintf(stderr, "awdog-saver: open %s failed: %s\n", pmsg_path,
+    fprintf(stderr, "awdog-saver: open %s failed: %s\n", pstore_path,
             strerror(errno));
     goto out;
   }
 
   if (awdog_write_all(fd, payload, payload_len) != 0 ||
       awdog_write_all(fd, "\n", 1) != 0) {
-    fprintf(stderr, "awdog-saver: write to %s failed: %s\n", pmsg_path,
+    fprintf(stderr, "awdog-saver: write to %s failed: %s\n", pstore_path,
             strerror(errno));
     goto out;
   }
