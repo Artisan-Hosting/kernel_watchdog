@@ -144,7 +144,7 @@ static int awdog_run_soscall(const char *phase, const char *reason,
     goto oom;
 
   pr_emerg(DRV_NAME ": trip phase=%s reason=%s\n", trip_phase, why);
-  return call_usermodehelper_exec(sub_info, UMH_NO_WAIT);
+  return call_usermodehelper_exec(sub_info, UMH_WAIT_PROC);
 
 oom:
   kfree(ctx->phase);
