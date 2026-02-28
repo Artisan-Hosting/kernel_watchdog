@@ -4,8 +4,8 @@ This directory contains the Linux kernel pieces that back the Artisan watchdog
 runtime. The kernel module exposes a character device that user space uses to
 register a monitored process and deliver signed heartbeat messages. When the
 heartbeats stop or fail validation, the module escalates to a user-mode helper
-that writes a persistent trip record to pstore/ramoops and, in production
-builds, requests an emergency reboot.
+that writes a trip record to a local append-only log file and, in production
+builds, requests a reboot.
 
 ## Directory Layout
 
@@ -51,37 +51,12 @@ sudo make -C driver install_dummy
 `driver/awdog_dummy.ko`. In this mode, trip handling still invokes
 `/sbin/awdog-saver` to persist trip records, but suppresses reboot.
 
-## Automate ramoops Reservation
+## Tamper Log Output
 
-The saver helper writes trip records to `/dev/pmsg0`, so production setups
-should reserve persistent RAM for pstore/ramoops at boot.
+The saver helper appends newline-delimited JSON trip records to:
 
-Use the helper script to auto-discover a suitable top-level `System RAM` range
-from `/proc/iomem`, generate kernel args, and optionally apply GRUB changes:
-
-```
-./scripts/configure_ramoops_grub.sh --dry-run
-./scripts/configure_ramoops_grub.sh --verify --dry-run
-./scripts/configure_ramoops_grub.sh --size-m 4 --dry-run
-sudo ./scripts/configure_ramoops_grub.sh --size-m 2 --apply
-```
-
-Selection rules:
-
-- Ignores `System RAM` ranges with child markers such as `Crash kernel`,
-  `Kernel ...`, `reserved`, or `ACPI ...`.
-- Enforces a 64 MiB guard band at both ends of the chosen range.
-- Aligns base to 1 MiB and sub-buffer sizes to 4 KiB.
-- Prefers the largest valid `System RAM` range, then places the reservation away
-  from the range end (centered within the guarded window when possible).
-
-Flags:
-
-- `--size-m N`: reserve `N` MiB (default `2`).
-- `--dry-run`: discovery + generated args only (default mode).
-- `--verify`: print chosen `/proc/iomem` line, guard window, and final base/end.
-- `--apply`: writes `/etc/default/grub.d/40-awdog-ramoops.cfg`, rebuilds GRUB
-  config, then requires a reboot.
+- default: `/var/log/.ais_tamper`
+- override: `AWDOG_LOG_PATH=<path>` or `--log-path <path>`
 
 ## Module Behaviour
 
@@ -102,8 +77,7 @@ Flags:
   - Production build:
     - `awdog_trip_now()` invokes `/sbin/awdog-saver` with
       `phase/reason/raw_line` metadata to persist a trip record into
-      `/dev/pmsg0` (persisted by the configured pstore backend, e.g.
-      `pstore_blk`).
+      `/var/log/.ais_tamper` (or configured `AWDOG_LOG_PATH` / `--log-path`).
     - The reboot path emits an additional `reboot_requested` trip record and
       then calls `emergency_restart()`.
   - Dummy/test build (`AWDOG_TEST_MODE`):
@@ -130,12 +104,11 @@ Flags:
 
 If the heartbeat stream stops or fails integrity checks, the module trips
 through `awdog_trip_now()` and invokes `/sbin/awdog-saver`. The helper writes a
-JSON `TripRecordMessage` to `/dev/pmsg0` with this shape:
+JSON `TripRecordMessage` to a local log file with this shape:
 
 - `ingested_at`: Unix timestamp when the helper emitted the record.
 - `source`: source tag (default `awdog-live-trip`).
-- `pstore_backend`: backend tag (default `pstore_blk`).
-- `pstore_sink`: write target path (default `/dev/pmsg0`).
+- `log_path`: write target path (default `/var/log/.ais_tamper`).
 - `phase`: trip classifier (`tamper_tripped`, `reboot_requested`,
   `heartbeat_rejected`, `test_mode_trip`, or caller-provided structured value).
 - `reason`: parsed trip reason.
@@ -145,8 +118,7 @@ JSON `TripRecordMessage` to `/dev/pmsg0` with this shape:
 
 Path overrides for integration testing:
 
-- The saver always emits `pstore_backend` as `pstore_blk`.
-- `AWDOG_PSTORE_PATH=/tmp/<file>` or `--pstore-path <path>`
+- `AWDOG_LOG_PATH=/tmp/<file>` or `--log-path <path>`
 
 Any consumer that wants to observe or override these actions should hook into
 `/sbin/awdog-saver` or adjust `awdog_run_soscall()` during integration.

@@ -58,6 +58,7 @@ struct awdog_ctx {
   /* async failure action (ordered saver -> reboot) */
   struct work_struct trip_work;
   char trip_reason[AWDOG_REASON_LEN];
+  atomic_t trip_active;
 
   /* crypto */
   struct crypto_shash *tfm; /* "hmac(sha256)" */
@@ -71,8 +72,10 @@ struct awdog_ctx {
 } g;
 
 static int awdog_reset_deadline_locked(void) {
-  g.deadline = jiffies + msecs_to_jiffies(g.hb_timeout_ms);
-  mod_timer(&g.timer, g.deadline);
+  unsigned long deadline = jiffies + msecs_to_jiffies(g.hb_timeout_ms);
+
+  WRITE_ONCE(g.deadline, deadline);
+  mod_timer(&g.timer, deadline);
   return 0;
 }
 
@@ -83,18 +86,80 @@ static void awdog_set_reason_locked(char *dst, size_t dst_len,
     dst[dst_len - 1] = '\0';
 }
 
+struct awdog_umh_ctx {
+  char *argv[8];
+  char *envp[3];
+  char *phase;
+  char *reason;
+  char *raw_line;
+};
+
+static void awdog_umh_cleanup(struct subprocess_info *info) {
+  struct awdog_umh_ctx *ctx = info ? info->data : NULL;
+
+  if (!ctx)
+    return;
+
+  kfree(ctx->phase);
+  kfree(ctx->reason);
+  kfree(ctx->raw_line);
+  kfree(ctx);
+}
+
 static int awdog_run_soscall(const char *phase, const char *reason,
                              const char *raw_line) {
   const char *trip_phase = phase ? phase : "tamper_tripped";
   const char *why = reason ? reason : "unknown";
   const char *line = raw_line ? raw_line : "";
-  static char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-  char *argv[] = {"/sbin/awdog-saver", "--phase", (char *)trip_phase,
-                  "--reason",         (char *)why, "--raw-line",
-                  (char *)line,       NULL};
+  struct awdog_umh_ctx *ctx;
+  struct subprocess_info *sub_info;
+
+  ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+  if (!ctx)
+    return -ENOMEM;
+
+  ctx->phase = kstrdup(trip_phase, GFP_KERNEL);
+  ctx->reason = kstrdup(why, GFP_KERNEL);
+  ctx->raw_line = kstrdup(line, GFP_KERNEL);
+  if (!ctx->phase || !ctx->reason || !ctx->raw_line)
+    goto oom;
+
+  ctx->argv[0] = "/sbin/awdog-saver";
+  ctx->argv[1] = "--phase";
+  ctx->argv[2] = ctx->phase;
+  ctx->argv[3] = "--reason";
+  ctx->argv[4] = ctx->reason;
+  ctx->argv[5] = "--raw-line";
+  ctx->argv[6] = ctx->raw_line;
+  ctx->argv[7] = NULL;
+
+  ctx->envp[0] = "HOME=/";
+  ctx->envp[1] = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
+  ctx->envp[2] = NULL;
+
+  sub_info = call_usermodehelper_setup(ctx->argv[0], ctx->argv, ctx->envp,
+                                       GFP_KERNEL, NULL, awdog_umh_cleanup,
+                                       ctx);
+  if (!sub_info)
+    goto oom;
 
   pr_emerg(DRV_NAME ": trip phase=%s reason=%s\n", trip_phase, why);
-  return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+  return call_usermodehelper_exec(sub_info, UMH_NO_WAIT);
+
+oom:
+  kfree(ctx->phase);
+  kfree(ctx->reason);
+  kfree(ctx->raw_line);
+  kfree(ctx);
+  return -ENOMEM;
+}
+
+static bool awdog_begin_trip_once(void) {
+  return atomic_cmpxchg(&g.trip_active, 0, 1) == 0;
+}
+
+static void awdog_end_trip(void) {
+  atomic_set(&g.trip_active, 0);
 }
 
 static void awdog_run_reboot(const char *reason) {
@@ -104,13 +169,25 @@ static void awdog_run_reboot(const char *reason) {
   if (awdog_run_soscall("reboot_requested", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (reboot_requested)\n");
   // emergency_restart();
-  panic("AWDOG trip: reason=%s", why);
+  // panic("AWDOG trip: reason=%s", why);
+  kernel_restart(NULL);
+  pr_err(DRV_NAME ": kernel_restart returned unexpectedly\n");
+  awdog_end_trip();
 }
 
 static void awdog_trip_now(const char *reason) {
   const char *why = reason ? reason : "unknown";
   const char *phase = "tamper_tripped";
   char raw_line[AWDOG_REASON_LEN + 64];
+
+  if (!awdog_begin_trip_once()) {
+    pr_warn(DRV_NAME ": trip already in progress, ignoring (%s)\n", why);
+    return;
+  }
+
+  WRITE_ONCE(g.registered, false);
+  timer_shutdown_sync(&g.timer);
+
   scnprintf(raw_line, sizeof(raw_line), "awdog: tamper tripped: %s", why);
 
   if (!strcmp(why, "timeout") || !strcmp(why, "verify-failed"))
@@ -120,6 +197,7 @@ static void awdog_trip_now(const char *reason) {
   pr_emerg("AWDOG_REBOOT: phase=reboot_requested reason=%s raw=%s\n", why, raw_line);
   if (awdog_run_soscall("test_mode_trip", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (%s)\n", why);
+  awdog_end_trip();
   return;
 #endif
 
@@ -287,7 +365,8 @@ static long awdog_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     g.proto_ver = r.proto_ver;
     g.last_nonce = 0;
     g.last_hb_mono_ns = 0;
-    g.registered = true;
+    WRITE_ONCE(g.registered, true);
+    atomic_set(&g.trip_active, 0);
     memset(g.trip_reason, 0, sizeof(g.trip_reason));
     awdog_reset_deadline_locked();
     mutex_unlock(&g.lock);
@@ -299,10 +378,11 @@ static long awdog_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
   case AWDOG_IOCTL_UNREG: {
     mutex_lock(&g.lock);
     memset(g.key, 0, AWDOG_KEY_LEN);
-    g.registered = false;
+    WRITE_ONCE(g.registered, false);
     g.pid = 0;
     g.last_nonce = 0;
     g.last_hb_mono_ns = 0;
+    atomic_set(&g.trip_active, 0);
     memset(g.trip_reason, 0, sizeof(g.trip_reason));
     timer_shutdown_sync(&g.timer);
     mutex_unlock(&g.lock);
@@ -319,6 +399,7 @@ static ssize_t awdog_write(struct file *f, const char __user *buf, size_t len,
                            loff_t *ppos) {
   struct awdog_hb hb;
   int ret = 0;
+  bool should_trip = false;
 
   if (len != sizeof(hb))
     return -EINVAL;
@@ -333,17 +414,21 @@ static ssize_t awdog_write(struct file *f, const char __user *buf, size_t len,
 
   if (!awdog_sanity_pid_exe(hb.pid, hb.exe_fingerprint)) {
     ret = -EPERM;
+    should_trip = true;
     goto out;
   }
 
   if (hb.monotonic_nonce <= g.last_nonce) {
     ret = -EINVAL;
+    should_trip = true;
     goto out;
   }
 
   ret = awdog_hmac_verify(&hb);
-  if (ret)
+  if (ret) {
+    should_trip = true;
     goto out;
+  }
 
   {
     u64 now_mono_ns = ktime_get_ns();
@@ -372,7 +457,7 @@ static ssize_t awdog_write(struct file *f, const char __user *buf, size_t len,
   ret = sizeof(hb);
 out:
   mutex_unlock(&g.lock);
-  if (ret < 0) {
+  if (ret < 0 && should_trip) {
     pr_warn(DRV_NAME ": bad heartbeat (%d), triggering saver+reboot\n", ret);
     awdog_trip_now("verify-failed");
     // awdog_run_ko_test("verify-failed");
@@ -393,6 +478,7 @@ static int __init awdog_init(void) {
 
   mutex_init(&g.lock);
   spin_lock_init(&g.work_lock);
+  atomic_set(&g.trip_active, 0);
   INIT_WORK(&g.trip_work, awdog_trip_workfn);
 
   g.tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);

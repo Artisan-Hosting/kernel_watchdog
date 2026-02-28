@@ -12,8 +12,7 @@
 #include <unistd.h>
 
 #define AWDOG_DEFAULT_SOURCE "awdog-live-trip"
-#define AWDOG_DEFAULT_PSTORE_BACKEND "pstore_blk"
-#define AWDOG_DEFAULT_PSTORE_PATH "/dev/sda"
+#define AWDOG_DEFAULT_LOG_PATH "/var/log/.ais_tamper"
 #define AWDOG_MAX_ATTRS 32
 #define AWDOG_MAX_KEY_LEN 64
 #define AWDOG_MAX_VAL_LEN 256
@@ -31,7 +30,7 @@ struct awdog_attr_set {
 static void awdog_usage(const char *prog) {
   fprintf(stderr,
           "Usage: %s [--phase PHASE] [--reason REASON] [--raw-line LINE] "
-          "[--source SOURCE] [--pstore-path PATH] [MESSAGE]\n",
+          "[--source SOURCE] [--log-path PATH] [MESSAGE]\n",
           prog);
 }
 
@@ -118,9 +117,7 @@ static const char *awdog_find_attr(const struct awdog_attr_set *set,
 static bool awdog_reserved_key(const char *key) {
   return awdog_streq(key, "phase") || awdog_streq(key, "reason") ||
          awdog_streq(key, "raw_line") || awdog_streq(key, "source") ||
-         awdog_streq(key, "ingested_at") ||
-         awdog_streq(key, "pstore_backend") || awdog_streq(key, "backend") ||
-         awdog_streq(key, "pstore_sink") || awdog_streq(key, "pstore_path");
+         awdog_streq(key, "ingested_at") || awdog_streq(key, "log_path");
 }
 
 static void awdog_parse_attrs(const char *input, struct awdog_attr_set *attrs) {
@@ -251,15 +248,14 @@ int main(int argc, char **argv) {
   const char *reason_arg = NULL;
   const char *raw_line_arg = NULL;
   const char *source_arg = NULL;
-  const char *pstore_path_arg = NULL;
+  const char *log_path_arg = NULL;
   const char *phase;
   const char *reason;
   const char *raw_line;
   const char *source;
-  const char *backend;
-  const char *pstore_path;
+  const char *log_path;
   const char *env_source;
-  const char *env_pstore_path;
+  const char *env_log_path;
   struct awdog_attr_set attrs = {0};
   char *message = NULL;
   char raw_line_buf[512];
@@ -305,12 +301,12 @@ int main(int argc, char **argv) {
       source_arg = argv[++i];
       continue;
     }
-    if (!strcmp(argv[i], "--pstore-path")) {
+    if (!strcmp(argv[i], "--log-path")) {
       if (i + 1 >= argc) {
         awdog_usage(argv[0]);
         goto out;
       }
-      pstore_path_arg = argv[++i];
+      log_path_arg = argv[++i];
       continue;
     }
     if (!strcmp(argv[i], "--")) {
@@ -363,14 +359,12 @@ int main(int argc, char **argv) {
   if (!source || !*source)
     source = AWDOG_DEFAULT_SOURCE;
 
-  backend = AWDOG_DEFAULT_PSTORE_BACKEND;
-
-  env_pstore_path = getenv("AWDOG_PSTORE_PATH");
-  pstore_path = pstore_path_arg ? pstore_path_arg : awdog_find_attr(&attrs, "pstore_path");
-  if (!pstore_path || !*pstore_path)
-    pstore_path = env_pstore_path;
-  if (!pstore_path || !*pstore_path)
-    pstore_path = AWDOG_DEFAULT_PSTORE_PATH;
+  env_log_path = getenv("AWDOG_LOG_PATH");
+  log_path = log_path_arg ? log_path_arg : awdog_find_attr(&attrs, "log_path");
+  if (!log_path || !*log_path)
+    log_path = env_log_path;
+  if (!log_path || !*log_path)
+    log_path = AWDOG_DEFAULT_LOG_PATH;
 
   mem = open_memstream(&payload, &payload_len);
   if (!mem) {
@@ -383,10 +377,8 @@ int main(int argc, char **argv) {
   fprintf(mem, "%lld", (long long)now);
   fputs(",\"source\":", mem);
   awdog_json_string(mem, source);
-  fputs(",\"pstore_backend\":", mem);
-  awdog_json_string(mem, backend);
-  fputs(",\"pstore_sink\":", mem);
-  awdog_json_string(mem, pstore_path);
+  fputs(",\"log_path\":", mem);
+  awdog_json_string(mem, log_path);
   fputs(",\"phase\":", mem);
   awdog_json_string(mem, phase);
   fputs(",\"reason\":", mem);
@@ -414,21 +406,16 @@ int main(int argc, char **argv) {
   }
   mem = NULL;
 
-  if ((pstore_path_arg && *pstore_path_arg) ||
-      (awdog_find_attr(&attrs, "pstore_path")) ||
-      (env_pstore_path && *env_pstore_path))
-    fd = open(pstore_path, O_WRONLY | O_CLOEXEC | O_APPEND | O_CREAT, 0644);
-  else
-    fd = open(pstore_path, O_WRONLY | O_CLOEXEC);
+  fd = open(log_path, O_WRONLY | O_CLOEXEC | O_APPEND | O_CREAT, 0600);
   if (fd < 0) {
-    fprintf(stderr, "awdog-saver: open %s failed: %s\n", pstore_path,
+    fprintf(stderr, "awdog-saver: open %s failed: %s\n", log_path,
             strerror(errno));
     goto out;
   }
 
   if (awdog_write_all(fd, payload, payload_len) != 0 ||
       awdog_write_all(fd, "\n", 1) != 0) {
-    fprintf(stderr, "awdog-saver: write to %s failed: %s\n", pstore_path,
+    fprintf(stderr, "awdog-saver: write to %s failed: %s\n", log_path,
             strerror(errno));
     goto out;
   }
