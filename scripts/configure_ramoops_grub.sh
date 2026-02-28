@@ -326,9 +326,13 @@ build_kernel_args() {
   base_hex=$(to_hex "$base")
 
   # Note: using "$SIZE_M"M is fine since size_bytes derived from it.
-  printf 'memmap=%sM\\$%s ramoops.mem_address=%s ramoops.mem_size=%s ramoops.record_size=%s ramoops.console_size=%s ramoops.pmsg_size=%s ramoops.ecc=0\n' \
-    "$SIZE_M" "$base_hex" "$base_hex" "$(to_hex "$size_bytes")" \
-    "$(to_hex "$record_size")" "$(to_hex "$console_size")" "$(to_hex "$pmsg_size")"
+  # printf 'memmap=%sM\\$%s ramoops.mem_address=%s ramoops.mem_size=%s ramoops.record_size=%s ramoops.console_size=%s ramoops.pmsg_size=%s ramoops.ecc=0\n' \
+  #   "$SIZE_M" "$base_hex" "$base_hex" "$(to_hex "$size_bytes")" \
+  #   "$(to_hex "$record_size")" "$(to_hex "$console_size")" "$(to_hex "$pmsg_size")"
+
+  printf 'ramoops.mem_address=%s ramoops.mem_size=%s ramoops.record_size=%s ramoops.console_size=%s ramoops.pmsg_size=%s ramoops.ecc=0 printk.always_kmsg_dump=Y\n' \
+  "$base_hex" "$(to_hex "$size_bytes")" \
+  "$(to_hex "$record_size")" "$(to_hex "$console_size")" "$(to_hex "$pmsg_size")"
 }
 
 dump_chosen_block() {
