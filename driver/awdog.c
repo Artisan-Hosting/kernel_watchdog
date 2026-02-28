@@ -158,9 +158,9 @@ static bool awdog_begin_trip_once(void) {
   return atomic_cmpxchg(&g.trip_active, 0, 1) == 0;
 }
 
-static void awdog_end_trip(void) {
-  atomic_set(&g.trip_active, 0);
-}
+// static void awdog_end_trip(void) {
+//   atomic_set(&g.trip_active, 0);
+// }
 
 static void awdog_run_reboot(const char *reason) {
   const char *why = reason ? reason : "unknown";
@@ -168,11 +168,11 @@ static void awdog_run_reboot(const char *reason) {
   scnprintf(raw_line, sizeof(raw_line), DRV_NAME ": reboot requested (%s)", why);
   if (awdog_run_soscall("reboot_requested", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (reboot_requested)\n");
-  // emergency_restart();
-  // panic("AWDOG trip: reason=%s", why);
-  kernel_restart(NULL);
-  pr_err(DRV_NAME ": kernel_restart returned unexpectedly\n");
-  awdog_end_trip();
+  emergency_restart();
+  // // panic("AWDOG trip: reason=%s", why);
+  // kernel_restart(NULL);
+  // pr_err(DRV_NAME ": kernel_restart returned unexpectedly\n");
+  // awdog_end_trip();
 }
 
 static void awdog_trip_now(const char *reason) {
