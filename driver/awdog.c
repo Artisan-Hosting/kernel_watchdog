@@ -103,7 +103,6 @@ static void awdog_run_reboot(const char *reason) {
   scnprintf(raw_line, sizeof(raw_line), DRV_NAME ": reboot requested (%s)", why);
   if (awdog_run_soscall("reboot_requested", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (reboot_requested)\n");
-  pr_emerg(DRV_NAME ": reboot requested (%s)\n", why);
   emergency_restart();
 }
 
@@ -117,7 +116,7 @@ static void awdog_trip_now(const char *reason) {
     phase = "heartbeat_rejected";
 
 #ifdef AWDOG_TEST_MODE
-  pr_emerg("AWDOG_REBOOT_TEST: phase=reboot_requested reason=%s raw=%s\n", why, raw_line);
+  pr_emerg("AWDOG_REBOOT: phase=reboot_requested reason=%s raw=%s\n", why, raw_line);
   if (awdog_run_soscall("test_mode_trip", why, raw_line))
     pr_err(DRV_NAME ": saver helper failed (%s)\n", why);
   return;
